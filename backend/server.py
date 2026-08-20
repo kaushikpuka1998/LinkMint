@@ -267,6 +267,39 @@ class LinkCreate(BaseModel):
     expires_at: Optional[str] = None
 
 
+class BulkShortenInput(BaseModel):
+    urls: List[str]
+
+
+class BulkShortenItem(BaseModel):
+    url: str
+    code: Optional[str] = None
+    error: Optional[str] = None
+
+
+class BulkShortenResponse(BaseModel):
+    results: List[BulkShortenItem]
+    created: int
+    failed: int
+
+
+class LinkUpdate(BaseModel):
+    url: Optional[str] = None
+    expires_at: Optional[str] = None
+    clear_expiry: bool = False
+
+
+class DailyPoint(BaseModel):
+    date: str
+    clicks: int
+
+
+class AnalyticsResponse(BaseModel):
+    code: str
+    total_clicks: int
+    series: List[DailyPoint]
+
+
 class Link(BaseModel):
     model_config = ConfigDict(extra='ignore')
 
@@ -541,6 +574,104 @@ async def shorten(payload: LinkCreate, request: Request):
     return doc_to_link(doc)
 
 
+@api_router.post('/shorten/bulk', response_model=BulkShortenResponse)
+async def shorten_bulk(payload: BulkShortenInput, request: Request):
+    user = await require_user(request)  # bulk shortening is for signed-in users only
+    raw_urls = [u.strip() for u in payload.urls if u and u.strip()]
+    if not raw_urls:
+        raise HTTPException(status_code=422, detail='Provide at least one URL')
+    if len(raw_urls) > 50:
+        raise HTTPException(status_code=422, detail='Maximum 50 URLs per batch')
+
+    results: List[BulkShortenItem] = []
+    for raw in raw_urls:
+        try:
+            url = normalize_url(raw)
+        except ValueError as e:
+            results.append(BulkShortenItem(url=raw, error=str(e)))
+            continue
+        code = generate_code()
+        for _ in range(5):
+            if not await db.links.find_one({'code': code}, {'_id': 0}):
+                break
+            code = generate_code()
+        else:
+            results.append(BulkShortenItem(url=url, error='Could not generate a unique code'))
+            continue
+        doc = {
+            'id': str(uuid.uuid4()),
+            'code': code,
+            'url': url,
+            'clicks': 0,
+            'created_at': now_utc().isoformat(),
+            'expires_at': None,
+            'owner_id': user['user_id'],
+        }
+        await db.links.insert_one(dict(doc))
+        await cache_set(code, {'url': url, 'expires_at': None})
+        results.append(BulkShortenItem(url=url, code=code))
+
+    created = sum(1 for r in results if r.code)
+    logger.info('Bulk shorten by %s: %d created, %d failed', user['user_id'], created, len(results) - created)
+    return BulkShortenResponse(results=results, created=created, failed=len(results) - created)
+
+
+@api_router.patch('/links/{code}', response_model=Link)
+async def update_link(code: str, payload: LinkUpdate, request: Request):
+    user = await get_current_user(request)
+    doc = await db.links.find_one({'code': code}, {'_id': 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail='Link not found')
+    owner_id = doc.get('owner_id')
+    if owner_id is not None and (not user or user['user_id'] != owner_id):
+        raise HTTPException(status_code=403, detail='You do not own this link')
+
+    updates = {}
+    if payload.url is not None and payload.url.strip():
+        try:
+            updates['url'] = normalize_url(payload.url)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+    if payload.clear_expiry:
+        updates['expires_at'] = None
+    elif payload.expires_at:
+        try:
+            dt = parse_dt(payload.expires_at)
+            if dt <= now_utc():
+                raise HTTPException(status_code=422, detail='Expiration must be in the future')
+            updates['expires_at'] = dt.isoformat()
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=422, detail='Invalid expiration date')
+    if not updates:
+        raise HTTPException(status_code=422, detail='Nothing to update')
+
+    await db.links.update_one({'code': code}, {'$set': updates})
+    doc.update(updates)
+    await cache_set(code, {'url': doc['url'], 'expires_at': doc.get('expires_at')})
+    logger.info('Updated link %s (fields=%s)', code, list(updates.keys()))
+    return doc_to_link(doc)
+
+
+@api_router.get('/links/{code}/analytics', response_model=AnalyticsResponse)
+async def link_analytics(code: str, request: Request, days: int = 30):
+    user = await get_current_user(request)
+    doc = await db.links.find_one({'code': code}, {'_id': 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail='Link not found')
+    owner_id = doc.get('owner_id')
+    if owner_id is not None and (not user or user['user_id'] != owner_id):
+        raise HTTPException(status_code=403, detail='You do not own this link')
+    days = max(7, min(days, 90))
+    daily = doc.get('daily', {}) or {}
+    series = []
+    for i in range(days - 1, -1, -1):
+        d = (now_utc() - timedelta(days=i)).strftime('%Y-%m-%d')
+        series.append(DailyPoint(date=d, clicks=int(daily.get(d, 0))))
+    return AnalyticsResponse(code=code, total_clicks=int(doc.get('clicks', 0)), series=series)
+
+
 @api_router.get('/links', response_model=PaginatedLinks)
 async def list_links(request: Request, q: str = '', page: int = 1, limit: int = 25):
     user = await get_current_user(request)
@@ -631,7 +762,10 @@ async def _resolve_code(code: str) -> str:
             raise HTTPException(status_code=410, detail='This link has expired')
         url = doc['url']
         await cache_set(code, {'url': url, 'expires_at': doc.get('expires_at')})
-    await db.links.update_one({'code': code}, {'$inc': {'clicks': 1}})
+    await db.links.update_one(
+        {'code': code},
+        {'$inc': {'clicks': 1, f'daily.{now_utc().strftime("%Y-%m-%d")}': 1}},
+    )
     return url
 
 

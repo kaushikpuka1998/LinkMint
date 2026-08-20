@@ -39,6 +39,10 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { BulkShorten } from "@/components/BulkShorten";
+import { EditLinkDialog } from "@/components/EditLinkDialog";
+import { LinkAnalyticsDialog } from "@/components/LinkAnalyticsDialog";
 import {
   Table,
   TableBody,
@@ -275,6 +279,15 @@ export default function HomePage() {
               <CardTitle className="font-heading text-xl tracking-tight">Shorten a URL</CardTitle>
             </CardHeader>
             <CardContent>
+              <Tabs defaultValue="single">
+                <TabsList className="mb-4 grid w-full grid-cols-2 sm:w-64">
+                  <TabsTrigger value="single" data-testid="shorten-mode-single-tab">Single</TabsTrigger>
+                  <TabsTrigger value="bulk" data-testid="shorten-mode-bulk-tab">Bulk</TabsTrigger>
+                </TabsList>
+                <TabsContent value="bulk">
+                  <BulkShorten onDone={refresh} />
+                </TabsContent>
+                <TabsContent value="single">
               <form onSubmit={handleShorten} className="space-y-4">
                 <div className="space-y-2">
                   <Label htmlFor="long-url">Paste a long URL</Label>
@@ -377,6 +390,8 @@ export default function HomePage() {
                   <p className="mt-1.5 truncate text-xs text-muted-foreground">→ {result.url}</p>
                 </div>
               )}
+                </TabsContent>
+              </Tabs>
             </CardContent>
           </Card>
 
@@ -508,6 +523,8 @@ export default function HomePage() {
                                   <Copy className="h-4 w-4" />
                                 </Button>
                                 <QrDialog code={link.code} iconOnly triggerTestId="links-row-qr-button" />
+                                <LinkAnalyticsDialog code={link.code} />
+                                <EditLinkDialog link={link} onSaved={refresh} />
                                 <DeleteButton code={link.code} onConfirm={handleDelete} />
                               </div>
                             </TableCell>
@@ -545,6 +562,8 @@ export default function HomePage() {
                               <Copy className="h-4 w-4" />
                             </Button>
                             <QrDialog code={link.code} iconOnly />
+                            <LinkAnalyticsDialog code={link.code} />
+                            <EditLinkDialog link={link} onSaved={refresh} />
                             <DeleteButton code={link.code} onConfirm={handleDelete} />
                           </div>
                         </div>

@@ -602,10 +602,326 @@ class LinkMintTester:
         assert resp.status_code == 404, f"Expected 404 for nonexistent QR, got {resp.status_code}"
         self.log(f"   Correctly returned 404 for nonexistent QR code")
     
+    # ========== PHASE 6: BULK SHORTENING TESTS ==========
+    
+    def test_bulk_anonymous_401(self):
+        """POST /api/shorten/bulk without auth - should return 401"""
+        resp = requests.post(f"{BASE_URL}/shorten/bulk", json={"urls": ["https://example.com"]})
+        assert resp.status_code == 401, f"Expected 401 for anonymous bulk, got {resp.status_code}"
+        self.log(f"   Correctly returned 401 for anonymous bulk shortening")
+    
+    def test_bulk_authenticated_success(self):
+        """POST /api/shorten/bulk with auth - creates multiple links"""
+        cookies = {'session_token': self.session_token}
+        urls = [
+            "https://example.com/bulk1",
+            "https://example.com/bulk2",
+            "example.com/bulk3"  # Test https:// prefix
+        ]
+        resp = requests.post(f"{BASE_URL}/shorten/bulk", json={"urls": urls}, cookies=cookies)
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+        data = resp.json()
+        assert 'results' in data, "Missing 'results' field"
+        assert 'created' in data, "Missing 'created' field"
+        assert 'failed' in data, "Missing 'failed' field"
+        assert data['created'] == 3, f"Expected 3 created, got {data['created']}"
+        assert data['failed'] == 0, f"Expected 0 failed, got {data['failed']}"
+        
+        # Check results structure
+        for r in data['results']:
+            assert 'url' in r, "Result missing 'url'"
+            if r.get('code'):
+                self.created_codes.append(r['code'])
+                # Check https:// prefix was added
+                assert r['url'].startswith('https://'), f"URL not prefixed: {r['url']}"
+        
+        self.log(f"   Bulk created {data['created']} links, {data['failed']} failed")
+    
+    def test_bulk_mixed_urls(self):
+        """POST /api/shorten/bulk with mixed valid/invalid URLs - returns per-item results"""
+        cookies = {'session_token': self.session_token}
+        urls = [
+            "https://example.com/valid1",
+            "notaurl",  # Invalid
+            "https://example.com/valid2"
+        ]
+        resp = requests.post(f"{BASE_URL}/shorten/bulk", json={"urls": urls}, cookies=cookies)
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
+        data = resp.json()
+        assert data['created'] == 2, f"Expected 2 created, got {data['created']}"
+        assert data['failed'] == 1, f"Expected 1 failed, got {data['failed']}"
+        
+        # Check error in results
+        error_result = next((r for r in data['results'] if r.get('error')), None)
+        assert error_result is not None, "Should have one error result"
+        assert error_result['url'] == 'notaurl', f"Error result URL mismatch"
+        
+        # Collect created codes
+        for r in data['results']:
+            if r.get('code'):
+                self.created_codes.append(r['code'])
+        
+        self.log(f"   Bulk with mixed URLs: {data['created']} created, {data['failed']} failed")
+    
+    def test_bulk_empty_list_422(self):
+        """POST /api/shorten/bulk with empty list - should return 422"""
+        cookies = {'session_token': self.session_token}
+        resp = requests.post(f"{BASE_URL}/shorten/bulk", json={"urls": []}, cookies=cookies)
+        assert resp.status_code == 422, f"Expected 422 for empty list, got {resp.status_code}"
+        self.log(f"   Correctly returned 422 for empty URL list")
+    
+    def test_bulk_over_50_urls_422(self):
+        """POST /api/shorten/bulk with >50 URLs - should return 422"""
+        cookies = {'session_token': self.session_token}
+        urls = [f"https://example.com/bulk{i}" for i in range(51)]
+        resp = requests.post(f"{BASE_URL}/shorten/bulk", json={"urls": urls}, cookies=cookies)
+        assert resp.status_code == 422, f"Expected 422 for >50 URLs, got {resp.status_code}"
+        self.log(f"   Correctly returned 422 for >50 URLs")
+    
+    # ========== PHASE 6: ANALYTICS TESTS ==========
+    
+    def test_analytics_click_tracking(self):
+        """GET /api/resolve/{code} increments both clicks and daily bucket"""
+        cookies = {'session_token': self.session_token}
+        # Create a link
+        resp = requests.post(f"{BASE_URL}/shorten", json={"url": "https://example.com/analytics-test"}, cookies=cookies)
+        code = resp.json()['code']
+        self.created_codes.append(code)
+        
+        # Resolve it to generate clicks
+        for _ in range(3):
+            resp = requests.get(f"{BASE_URL}/resolve/{code}")
+            assert resp.status_code == 200
+        
+        time.sleep(0.5)  # Give DB time to update
+        
+        # Get analytics
+        resp = requests.get(f"{BASE_URL}/links/{code}/analytics", cookies=cookies)
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+        data = resp.json()
+        assert 'code' in data, "Missing 'code' field"
+        assert 'total_clicks' in data, "Missing 'total_clicks' field"
+        assert 'series' in data, "Missing 'series' field"
+        assert data['total_clicks'] >= 3, f"Expected >=3 clicks, got {data['total_clicks']}"
+        
+        # Check today's bucket
+        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        today_point = next((p for p in data['series'] if p['date'] == today), None)
+        assert today_point is not None, f"Today's date {today} not in series"
+        assert today_point['clicks'] >= 3, f"Expected >=3 clicks today, got {today_point['clicks']}"
+        
+        self.log(f"   Analytics: {data['total_clicks']} total clicks, today={today_point['clicks']}")
+    
+    def test_analytics_series_length(self):
+        """GET /api/links/{code}/analytics?days=7 - series length clamped 7-90"""
+        cookies = {'session_token': self.session_token}
+        resp = requests.post(f"{BASE_URL}/shorten", json={"url": "https://example.com/series-test"}, cookies=cookies)
+        code = resp.json()['code']
+        self.created_codes.append(code)
+        
+        # Test days=7
+        resp = requests.get(f"{BASE_URL}/links/{code}/analytics", params={"days": 7}, cookies=cookies)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data['series']) == 7, f"Expected 7 days, got {len(data['series'])}"
+        
+        # Test days=90
+        resp = requests.get(f"{BASE_URL}/links/{code}/analytics", params={"days": 90}, cookies=cookies)
+        data = resp.json()
+        assert len(data['series']) == 90, f"Expected 90 days, got {len(data['series'])}"
+        
+        # Test days=5 (should clamp to 7)
+        resp = requests.get(f"{BASE_URL}/links/{code}/analytics", params={"days": 5}, cookies=cookies)
+        data = resp.json()
+        assert len(data['series']) == 7, f"Expected 7 days (clamped), got {len(data['series'])}"
+        
+        self.log(f"   Analytics series length clamping works correctly")
+    
+    def test_analytics_404_unknown_code(self):
+        """GET /api/links/nonexistent/analytics - should return 404"""
+        cookies = {'session_token': self.session_token}
+        resp = requests.get(f"{BASE_URL}/links/nonexistent-xyz/analytics", cookies=cookies)
+        assert resp.status_code == 404, f"Expected 404, got {resp.status_code}"
+        self.log(f"   Correctly returned 404 for nonexistent code analytics")
+    
+    def test_analytics_403_owned_link_by_anon(self):
+        """GET /api/links/{code}/analytics on owned link by anon - should return 403"""
+        cookies = {'session_token': self.session_token}
+        # Create owned link
+        resp = requests.post(f"{BASE_URL}/shorten", json={"url": "https://example.com/owned-analytics"}, cookies=cookies)
+        code = resp.json()['code']
+        self.created_codes.append(code)
+        
+        # Try to access analytics without auth
+        resp = requests.get(f"{BASE_URL}/links/{code}/analytics")
+        assert resp.status_code == 403, f"Expected 403 for anon accessing owned link analytics, got {resp.status_code}"
+        self.log(f"   Correctly returned 403 for anon accessing owned link analytics")
+    
+    def test_analytics_anonymous_link_accessible(self):
+        """GET /api/links/{code}/analytics on anonymous link - accessible to anyone"""
+        # Create anonymous link
+        resp = requests.post(f"{BASE_URL}/shorten", json={"url": "https://example.com/anon-analytics"})
+        code = resp.json()['code']
+        self.created_codes.append(code)
+        
+        # Access analytics without auth - should work
+        resp = requests.get(f"{BASE_URL}/links/{code}/analytics")
+        assert resp.status_code == 200, f"Expected 200 for anon link analytics, got {resp.status_code}"
+        data = resp.json()
+        assert 'total_clicks' in data
+        self.log(f"   Anonymous link analytics accessible to anyone")
+    
+    # ========== PHASE 6: LINK EDITING TESTS ==========
+    
+    def test_edit_url_cache_invalidation(self):
+        """PATCH /api/links/{code} changes URL and invalidates cache"""
+        cookies = {'session_token': self.session_token}
+        # Create link
+        resp = requests.post(f"{BASE_URL}/shorten", json={"url": "https://example.com/original"}, cookies=cookies)
+        code = resp.json()['code']
+        self.created_codes.append(code)
+        
+        # Edit URL
+        new_url = "https://example.com/updated"
+        resp = requests.patch(f"{BASE_URL}/links/{code}", json={"url": new_url}, cookies=cookies)
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+        data = resp.json()
+        assert data['url'] == new_url, f"Expected URL={new_url}, got {data['url']}"
+        assert data['code'] == code, "Short code should not change"
+        
+        # Verify resolve returns new URL (cache invalidation)
+        resp = requests.get(f"{BASE_URL}/resolve/{code}")
+        assert resp.status_code == 200
+        assert resp.json()['url'] == new_url, f"Resolve should return new URL"
+        
+        self.log(f"   Edit URL successful, cache invalidated, resolve returns new URL")
+    
+    def test_edit_set_future_expiry(self):
+        """PATCH /api/links/{code} sets future expiry"""
+        cookies = {'session_token': self.session_token}
+        resp = requests.post(f"{BASE_URL}/shorten", json={"url": "https://example.com/edit-expiry"}, cookies=cookies)
+        code = resp.json()['code']
+        self.created_codes.append(code)
+        
+        # Set expiry
+        future = datetime.now(timezone.utc) + timedelta(days=7)
+        resp = requests.patch(f"{BASE_URL}/links/{code}", json={"expires_at": future.isoformat()}, cookies=cookies)
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
+        data = resp.json()
+        assert data['expires_at'] is not None, "expires_at should be set"
+        self.log(f"   Set future expiry successfully")
+    
+    def test_edit_clear_expiry(self):
+        """PATCH /api/links/{code} with clear_expiry:true removes expiry"""
+        cookies = {'session_token': self.session_token}
+        # Create link with expiry
+        future = datetime.now(timezone.utc) + timedelta(days=7)
+        resp = requests.post(f"{BASE_URL}/shorten", json={
+            "url": "https://example.com/clear-expiry",
+            "expires_at": future.isoformat()
+        }, cookies=cookies)
+        code = resp.json()['code']
+        self.created_codes.append(code)
+        
+        # Clear expiry
+        resp = requests.patch(f"{BASE_URL}/links/{code}", json={"clear_expiry": True}, cookies=cookies)
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
+        data = resp.json()
+        assert data['expires_at'] is None, "expires_at should be None after clear_expiry"
+        self.log(f"   Clear expiry successful")
+    
+    def test_edit_past_expiry_422(self):
+        """PATCH /api/links/{code} with past expiry - should return 422"""
+        cookies = {'session_token': self.session_token}
+        resp = requests.post(f"{BASE_URL}/shorten", json={"url": "https://example.com/edit-past"}, cookies=cookies)
+        code = resp.json()['code']
+        self.created_codes.append(code)
+        
+        past = datetime.now(timezone.utc) - timedelta(days=1)
+        resp = requests.patch(f"{BASE_URL}/links/{code}", json={"expires_at": past.isoformat()}, cookies=cookies)
+        assert resp.status_code == 422, f"Expected 422 for past expiry, got {resp.status_code}"
+        self.log(f"   Correctly returned 422 for past expiry")
+    
+    def test_edit_invalid_url_422(self):
+        """PATCH /api/links/{code} with invalid URL - should return 422"""
+        cookies = {'session_token': self.session_token}
+        resp = requests.post(f"{BASE_URL}/shorten", json={"url": "https://example.com/edit-invalid"}, cookies=cookies)
+        code = resp.json()['code']
+        self.created_codes.append(code)
+        
+        resp = requests.patch(f"{BASE_URL}/links/{code}", json={"url": "notaurl"}, cookies=cookies)
+        assert resp.status_code == 422, f"Expected 422 for invalid URL, got {resp.status_code}"
+        self.log(f"   Correctly returned 422 for invalid URL")
+    
+    def test_edit_empty_body_422(self):
+        """PATCH /api/links/{code} with empty body - should return 422 'Nothing to update'"""
+        cookies = {'session_token': self.session_token}
+        resp = requests.post(f"{BASE_URL}/shorten", json={"url": "https://example.com/edit-empty"}, cookies=cookies)
+        code = resp.json()['code']
+        self.created_codes.append(code)
+        
+        resp = requests.patch(f"{BASE_URL}/links/{code}", json={}, cookies=cookies)
+        assert resp.status_code == 422, f"Expected 422 for empty body, got {resp.status_code}"
+        assert 'Nothing to update' in resp.text, "Should return 'Nothing to update' message"
+        self.log(f"   Correctly returned 422 for empty update body")
+    
+    def test_edit_403_anon_editing_owned_link(self):
+        """PATCH /api/links/{code} anon editing owned link - should return 403"""
+        cookies = {'session_token': self.session_token}
+        resp = requests.post(f"{BASE_URL}/shorten", json={"url": "https://example.com/owned-edit"}, cookies=cookies)
+        code = resp.json()['code']
+        self.created_codes.append(code)
+        
+        # Try to edit without auth
+        resp = requests.patch(f"{BASE_URL}/links/{code}", json={"url": "https://example.com/hacked"})
+        assert resp.status_code == 403, f"Expected 403 for anon editing owned link, got {resp.status_code}"
+        self.log(f"   Correctly returned 403 for anon editing owned link")
+    
+    def test_edit_404_unknown_code(self):
+        """PATCH /api/links/nonexistent - should return 404"""
+        cookies = {'session_token': self.session_token}
+        resp = requests.patch(f"{BASE_URL}/links/nonexistent-xyz", json={"url": "https://example.com"}, cookies=cookies)
+        assert resp.status_code == 404, f"Expected 404, got {resp.status_code}"
+        self.log(f"   Correctly returned 404 for nonexistent code")
+    
+    def test_edit_anonymous_link_by_anon(self):
+        """PATCH /api/links/{code} anonymous link editable by anon"""
+        # Create anonymous link
+        resp = requests.post(f"{BASE_URL}/shorten", json={"url": "https://example.com/anon-edit"})
+        code = resp.json()['code']
+        self.created_codes.append(code)
+        
+        # Edit without auth - should work
+        resp = requests.patch(f"{BASE_URL}/links/{code}", json={"url": "https://example.com/anon-edited"})
+        assert resp.status_code == 200, f"Expected 200 for anon editing anon link, got {resp.status_code}"
+        data = resp.json()
+        assert data['url'] == "https://example.com/anon-edited"
+        self.log(f"   Anonymous link editable by anyone")
+    
+    # ========== PHASE 6: ANONYMOUS RATE LIMIT REGRESSION ==========
+    
+    def test_anonymous_rate_limit_10_per_min(self):
+        """Anonymous rate limit: 10 creates/min per IP - should return 429 after 10"""
+        # Use a unique X-Forwarded-For IP to avoid conflicts with other tests
+        test_ip = f"192.168.100.{int(time.time()) % 255}"
+        headers = {'X-Forwarded-For': test_ip}
+        
+        # Create 10 links rapidly
+        for i in range(10):
+            resp = requests.post(f"{BASE_URL}/shorten", json={"url": f"https://example.com/ratelimit{i}"}, headers=headers)
+            if resp.status_code == 200:
+                self.created_codes.append(resp.json()['code'])
+        
+        # 11th request should get 429
+        resp = requests.post(f"{BASE_URL}/shorten", json={"url": "https://example.com/ratelimit11"}, headers=headers)
+        assert resp.status_code == 429, f"Expected 429 after 10 requests, got {resp.status_code}"
+        assert 'Retry-After' in resp.headers, "Missing Retry-After header"
+        self.log(f"   Anonymous rate limit working: 429 after 10 requests from IP {test_ip}")
+    
     def run_all_tests(self):
         """Run all tests in order"""
         self.log("=" * 60, Colors.BLUE)
-        self.log("LinkMint Backend API Test Suite - Phase 1-4", Colors.BLUE)
+        self.log("LinkMint Backend API Test Suite - Phase 1-6", Colors.BLUE)
         self.log(f"Testing: {BASE_URL}", Colors.BLUE)
         self.log("=" * 60, Colors.BLUE)
         
@@ -667,6 +983,38 @@ class LinkMintTester:
         self.log("\n📱 PHASE 4: QR Codes", Colors.YELLOW)
         self.test("GET /qr/{code} returns image/png", self.test_qr_code_success)
         self.test("GET /qr/nonexistent returns 404", self.test_qr_code_nonexistent)
+        
+        # Phase 6: Bulk Shortening
+        self.log("\n📦 PHASE 6: Bulk Shortening", Colors.YELLOW)
+        self.test("Bulk anonymous returns 401", self.test_bulk_anonymous_401)
+        self.test("Bulk authenticated success", self.test_bulk_authenticated_success)
+        self.test("Bulk with mixed valid/invalid URLs", self.test_bulk_mixed_urls)
+        self.test("Bulk empty list returns 422", self.test_bulk_empty_list_422)
+        self.test("Bulk >50 URLs returns 422", self.test_bulk_over_50_urls_422)
+        
+        # Phase 6: Analytics
+        self.log("\n📊 PHASE 6: Click Analytics", Colors.YELLOW)
+        self.test("Analytics click tracking (total + daily)", self.test_analytics_click_tracking)
+        self.test("Analytics series length clamping (7-90)", self.test_analytics_series_length)
+        self.test("Analytics 404 for unknown code", self.test_analytics_404_unknown_code)
+        self.test("Analytics 403 for anon accessing owned link", self.test_analytics_403_owned_link_by_anon)
+        self.test("Analytics accessible for anonymous links", self.test_analytics_anonymous_link_accessible)
+        
+        # Phase 6: Link Editing
+        self.log("\n✏️ PHASE 6: Link Editing", Colors.YELLOW)
+        self.test("Edit URL and cache invalidation", self.test_edit_url_cache_invalidation)
+        self.test("Edit set future expiry", self.test_edit_set_future_expiry)
+        self.test("Edit clear expiry", self.test_edit_clear_expiry)
+        self.test("Edit past expiry returns 422", self.test_edit_past_expiry_422)
+        self.test("Edit invalid URL returns 422", self.test_edit_invalid_url_422)
+        self.test("Edit empty body returns 422", self.test_edit_empty_body_422)
+        self.test("Edit 403 for anon editing owned link", self.test_edit_403_anon_editing_owned_link)
+        self.test("Edit 404 for unknown code", self.test_edit_404_unknown_code)
+        self.test("Edit anonymous link by anon", self.test_edit_anonymous_link_by_anon)
+        
+        # Phase 6: Rate Limit Regression
+        self.log("\n🚦 PHASE 6: Rate Limit Regression", Colors.YELLOW)
+        self.test("Anonymous rate limit 10/min per IP", self.test_anonymous_rate_limit_10_per_min)
         
         # Cleanup
         self.cleanup()

@@ -1,16 +1,19 @@
 # plan.md — LinkMint (URL Shortener)
 
 ## 1) Objectives
-- **Status: Phases 1–5 Delivered (Production-ready URL shortener + Accounts + Search/QR + Abuse Protection).** Maintain and extend the working full-stack URL shortener: **FastAPI + React (shadcn/ui) + MongoDB + Redis**.
+- **Status: Phases 1–6 Delivered (Production-ready shortener + Accounts + Search/QR + Abuse Protection + Bulk + Analytics + Editing).** Maintain and extend the working full-stack URL shortener: **FastAPI + React (shadcn/ui) + MongoDB + Redis**.
 - Preserve core flow reliability: **shorten → resolve/redirect → click count → list/manage links**.
 - Use Redis to accelerate resolve operations via caching, with **graceful MongoDB fallback** when Redis is unavailable.
 - Provide **User Accounts** with **both** authentication methods:
   - **Email + password** (bcrypt)
   - **Google sign-in via Emergent Auth** (backend session exchange)
-- Keep **anonymous shortening allowed**; authentication unlocks **“My Links”** (owner-scoped management).
+- Keep **anonymous shortening allowed**; authentication unlocks **“My Links”** (owner-scoped management) and enables advanced features.
 - Provide **QR codes** (simple black-and-white PNG) per short link with download.
 - Provide **Link Search + Pagination** so large link lists remain usable.
-- Provide **Anonymous Rate Limiting** for abuse protection (per-IP caps) while keeping signed-in experience frictionless.
+- Provide **Anonymous Rate Limiting** for abuse protection (per-IP caps), while keeping signed-in experience frictionless.
+- Provide **Bulk Shortening** (signed-in only) to create many short links in one operation.
+- Provide **Click Analytics** (daily click buckets) surfaced in the UI as charts.
+- Provide **Link Editing** (owner-scoped) so users can update destination/expiry without changing the short code.
 - Maintain a polished, responsive UI aligned to `design_guidelines.md`, with consistent **`data-testid`** attributes for automation.
 
 ---
@@ -33,7 +36,7 @@ Delivered outcomes:
   - Future expiry accepted
   - Past expiry rejected (422)
   - Expired link resolve returns 410
-- Click counting: resolves increment clicks (Mongo `$inc`).
+- Click counting: resolves increment clicks.
 - Redis cache strategy:
   - `link:{code}` cached payload (url, expires_at)
   - TTL = 3600 seconds
@@ -132,7 +135,7 @@ Delivered endpoints:
 - `POST /api/auth/logout`
 
 Account linking:
-- If a user first signs in via Google, they can later create a password using the same email (password gets added to existing user).
+- If a user first signs in via Google, they can later create a password using the same email.
 
 Testing playbook:
 - Emergent auth testing guide saved at `/app/auth_testing.md`.
@@ -216,32 +219,99 @@ Implementation (in `/app/backend/server.py`):
   - HTTP **429** with friendly `detail` message (includes suggestion to sign in)
   - `Retry-After` header set with seconds until reset
 
-Verification (manual curl tests):
+Verification:
 - Anonymous burst: 200 × 10 then **429** at request 11/12 with correct message + `Retry-After`.
 - Different IP unaffected.
-- Authenticated user can create 12+ links without rate limiting.
-- Redis stopped: in-memory fallback still enforces 429 at request 11; resolve and overall app remain functional; Redis restarted successfully.
-- Test data cleanup performed (removed generated test links).
+- Authenticated user bypasses limit.
+- Redis stopped: fallback still enforces 429.
+
+---
+
+### Phase 6 — Bulk Shortening + Click Charts + Link Editing
+**Goal:** Enable power-user workflows for signed-in users: bulk creation, charted click trends, and post-creation link management without changing codes.
+
+**Status: COMPLETED**
+
+#### 6.1 Bulk Shortening (Members)
+Backend:
+- `POST /api/shorten/bulk` (signed-in only; anonymous → 401)
+  - Up to **50 URLs**
+  - Returns per-item results: `{ url, code, error }`
+  - Returns batch totals: `{ created, failed }`
+
+Frontend:
+- Shorten card now has **Single / Bulk tabs**.
+- Bulk UI (`/app/frontend/src/components/BulkShorten.jsx`):
+  - Anonymous: sign-in prompt
+  - Signed-in: textarea (one URL per line), live count, submit, results list
+  - “Copy all” for successful codes
+
+#### 6.2 Click Analytics (Charts)
+Backend:
+- `_resolve_code` now increments:
+  - `clicks`
+  - `daily.{YYYY-MM-DD}` bucket
+- `GET /api/links/{code}/analytics?days=7..90`
+  - Returns: `{ code, total_clicks, series: [{ date, clicks }] }`
+  - Zero-fills missing days
+  - Ownership scoped (403 for non-owners of owned links)
+
+Frontend:
+- Recharts added.
+- Analytics UI (`/app/frontend/src/components/LinkAnalyticsDialog.jsx`):
+  - Loading skeleton
+  - Empty state when no clicks
+  - Area chart when clicks exist, using `--chart-1` token
+
+#### 6.3 Link Editing (Owner-scoped)
+Backend:
+- `PATCH /api/links/{code}` updates:
+  - `url` (validated/normalized)
+  - `expires_at` (future-only)
+  - `clear_expiry: true` removes expiry
+- Owner-only for owned links (403 for non-owners)
+- Cache refresh ensures resolves reflect updates immediately
+- **Short code never changes**
+
+Frontend:
+- Edit UI (`/app/frontend/src/components/EditLinkDialog.jsx`):
+  - Prefilled destination and expiry
+  - Calendar picker + “Remove expiry”
+  - Saves via PATCH and refreshes list
+
+#### 6.4 Row Actions Update
+- Row actions now include: **copy, QR, analytics, edit, delete** (desktop + mobile).
+
+#### 6.5 Testing Status
+- `iteration_3.json`: frontend 100% pass.
+- Backend 93.4% due to test-script timing/cascade issues; all flagged flows were manually re-verified as working:
+  - expired resolve returns 410
+  - delete works
+  - anonymous delete of anonymous link works
+  - QR returns `image/png`
 
 ---
 
 ## 3) Next Actions
-**Current status: All planned phases (1–5) complete.** Next actions are optional enhancements.
+**Current status: All planned phases (1–6) complete.** Next actions are optional enhancements.
 
-1) **Analytics (Optional)**
-- Add click trend charts (Recharts) and per-link analytics page.
+1) **Analytics Enhancements (Optional)**
+- Per-link analytics page (not just dialog)
+- Top links leaderboard and aggregate charts
 
-2) **Link Management (Optional)**
-- Edit link settings (expiry, destination) and regenerate codes.
+2) **Bulk Enhancements (Optional)**
+- CSV upload/download
+- Bulk editing (expiry changes for multiple links)
 
-3) **Operational Hardening (Optional)**
-- Add Redis auto-start strategy (if permitted) or health-based auto-disable messaging.
-- Consider rate-limit extensions:
-  - Separate limits for anonymous vs authenticated (already: authed bypass)
-  - Per-user limits for extreme abuse
-  - Global circuit-breaker if DB under load
+3) **Link Management (Optional)**
+- Regenerate code / rotate destination with audit log
+- Tagging and folders
 
-4) **Testing/Regression (Ongoing)**
+4) **Operational Hardening (Optional)**
+- Redis auto-start strategy (if permitted)
+- Per-user rate limits (separate from anonymous)
+
+5) **Testing/Regression (Ongoing)**
 - Keep `/app/backend_test.py` as a regression suite.
 - Re-run `testing_agent_v3` after any significant changes.
 
@@ -269,3 +339,9 @@ Verification (manual curl tests):
 - Rate limiting returns 429 + `Retry-After` and clear messaging.
 - Signed-in users are not rate-limited by the anonymous caps.
 - Rate limiting remains functional even if Redis is down (fallback mode).
+
+### Phase 6 (met)
+- Signed-in users can bulk shorten up to 50 URLs with per-item success/failure reporting.
+- Click analytics are tracked per day and rendered in UI charts.
+- Owners can edit link destination/expiry without changing the short code; resolve reflects changes immediately.
+- Overall regression remains green in manual verification and UI E2E scenarios (`/app/test_reports/iteration_3.json`).

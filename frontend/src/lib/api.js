@@ -9,10 +9,13 @@ const api = axios.create({
 
 // Links
 export const shortenUrl = (payload) => api.post("/shorten", payload);
+export const bulkShorten = (urls) => api.post("/shorten/bulk", { urls });
 export const getLinks = (params) => api.get("/links", { params });
 export const getStats = () => api.get("/stats");
 export const getHealth = () => api.get("/health");
 export const deleteLink = (code) => api.delete(`/links/${code}`);
+export const updateLink = (code, data) => api.patch(`/links/${code}`, data);
+export const getLinkAnalytics = (code, days = 30) => api.get(`/links/${code}/analytics`, { params: { days } });
 export const resolveCode = (code) => api.get(`/resolve/${code}`);
 
 // Auth
