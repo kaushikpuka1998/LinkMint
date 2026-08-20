@@ -14,6 +14,18 @@ Shorten a URL anonymously in one click, or sign in to keep a private, searchable
 library of links with per-link click charts, custom aliases, expiry dates and
 tag-based filtering.
 
+<img width="1286" height="1084" alt="Screenshot 2026-08-20 at 9 01 46 PM" src="https://github.com/user-attachments/assets/9e2b6b1b-fc55-4dfb-b2ed-5562145981a6" />
+<img width="1232" height="1099" alt="Screenshot 2026-08-20 at 9 01 25 PM" src="https://github.com/user-attachments/assets/701f348c-c727-4dd9-a9db-2a9947a6a26d" />
+
+<p align="center">
+  <img width="600" height="700" alt="Screenshot 2026-08-20 at 9 01 58 PM" src="https://github.com/user-attachments/assets/c2d0d2a5-ab43-4b35-9a01-984b69d8dd5f" />
+  <img width="600" height="700" alt="Screenshot 2026-08-20 at 9 01 39 PM" src="https://github.com/user-attachments/assets/8b1083cb-1a99-4adb-9299-58de1c52d696" />
+  <img width="600" height="700" alt="Screenshot 2026-08-20 at 9 01 28 PM" src="https://github.com/user-attachments/assets/a2391f41-4813-4cb2-98be-0ee226ec3f06" />
+</p>
+
+
+
+
 ## Features
 
 **Shortening**
