@@ -1,13 +1,27 @@
 import axios from "axios";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
-const API = `${BACKEND_URL}/api`;
 
-export const shortenUrl = (payload) => axios.post(`${API}/shorten`, payload);
-export const getLinks = () => axios.get(`${API}/links`);
-export const getStats = () => axios.get(`${API}/stats`);
-export const getHealth = () => axios.get(`${API}/health`);
-export const deleteLink = (code) => axios.delete(`${API}/links/${code}`);
-export const resolveCode = (code) => axios.get(`${API}/resolve/${code}`);
+const api = axios.create({
+  baseURL: `${BACKEND_URL}/api`,
+  withCredentials: true,
+});
 
+// Links
+export const shortenUrl = (payload) => api.post("/shorten", payload);
+export const getLinks = (params) => api.get("/links", { params });
+export const getStats = () => api.get("/stats");
+export const getHealth = () => api.get("/health");
+export const deleteLink = (code) => api.delete(`/links/${code}`);
+export const resolveCode = (code) => api.get(`/resolve/${code}`);
+
+// Auth
+export const registerUser = (data) => api.post("/auth/register", data);
+export const loginUser = (data) => api.post("/auth/login", data);
+export const exchangeSession = (sessionId) => api.post("/auth/session", { session_id: sessionId });
+export const getMe = () => api.get("/auth/me");
+export const logoutUser = () => api.post("/auth/logout");
+
+// Helpers
 export const shortUrlFor = (code) => `${window.location.origin}/${code}`;
+export const qrUrlFor = (code) => `${BACKEND_URL}/api/qr/${code}`;

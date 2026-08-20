@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
 import { format } from "date-fns";
 import { toast } from "sonner";
 import {
@@ -12,6 +13,13 @@ import {
   X,
   Scissors,
   Loader2,
+  QrCode,
+  Search,
+  ChevronLeft,
+  ChevronRight,
+  Download,
+  LogOut,
+  UserRound,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -21,6 +29,16 @@ import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Calendar } from "@/components/ui/calendar";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import {
   Table,
   TableBody,
@@ -40,7 +58,10 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
-import { shortenUrl, getLinks, getStats, getHealth, deleteLink, shortUrlFor } from "@/lib/api";
+import { shortenUrl, getLinks, getStats, getHealth, deleteLink, shortUrlFor, qrUrlFor } from "@/lib/api";
+import { useAuth } from "@/context/AuthContext";
+
+const PAGE_SIZE = 10;
 
 const copyText = async (text) => {
   try {
@@ -60,32 +81,51 @@ const copyText = async (text) => {
 const truncate = (str, n = 52) => (str.length > n ? str.slice(0, n) + "…" : str);
 
 export default function HomePage() {
+  const navigate = useNavigate();
+  const { user, logout } = useAuth();
   const [longUrl, setLongUrl] = useState("");
   const [alias, setAlias] = useState("");
   const [expiry, setExpiry] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState(null);
-  const [links, setLinks] = useState(null);
+  const [linksData, setLinksData] = useState(null); // {items, total, page, pages}
   const [stats, setStats] = useState(null);
   const [redisOk, setRedisOk] = useState(null);
+  const [q, setQ] = useState("");
+  const [debouncedQ, setDebouncedQ] = useState("");
+  const [page, setPage] = useState(1);
+
+  useEffect(() => {
+    const t = setTimeout(() => {
+      setDebouncedQ(q.trim());
+      setPage(1);
+    }, 350);
+    return () => clearTimeout(t);
+  }, [q]);
 
   const refresh = useCallback(async () => {
     try {
-      const [linksRes, statsRes] = await Promise.all([getLinks(), getStats()]);
-      setLinks(linksRes.data);
+      const [linksRes, statsRes] = await Promise.all([
+        getLinks({ q: debouncedQ, page, limit: PAGE_SIZE }),
+        getStats(),
+      ]);
+      setLinksData(linksRes.data);
       setStats(statsRes.data);
     } catch {
-      setLinks((prev) => prev ?? []);
+      setLinksData((prev) => prev ?? { items: [], total: 0, page: 1, pages: 1 });
       toast.error("Could not load links");
     }
-  }, []);
+  }, [debouncedQ, page]);
 
   useEffect(() => {
     refresh();
+  }, [refresh, user?.user_id]);
+
+  useEffect(() => {
     getHealth()
       .then((res) => setRedisOk(res.data.redis === "ok"))
       .catch(() => setRedisOk(false));
-  }, [refresh]);
+  }, []);
 
   const handleShorten = async (e) => {
     e.preventDefault();
@@ -133,10 +173,20 @@ export default function HomePage() {
       toast.success(`Deleted /${code}`);
       if (result?.code === code) setResult(null);
       refresh();
-    } catch {
-      toast.error("Could not delete link");
+    } catch (err) {
+      const detail = err?.response?.data?.detail;
+      toast.error(typeof detail === "string" ? detail : "Could not delete link");
     }
   };
+
+  const handleLogout = async () => {
+    await logout();
+    toast.success("Signed out");
+    refresh();
+  };
+
+  const links = linksData?.items ?? null;
+  const totalPages = linksData?.pages ?? 1;
 
   const statCards = [
     { title: "Total links", value: stats?.total_links, icon: Link2, testId: "stats-total-links" },
@@ -155,18 +205,54 @@ export default function HomePage() {
             </span>
             <span className="font-heading text-lg font-semibold tracking-tight">LinkMint</span>
           </a>
-          <Badge
-            variant="outline"
-            data-testid="topbar-status-pill"
-            className="gap-1.5 rounded-full px-3 py-1 text-xs font-normal text-muted-foreground"
-          >
-            <span
-              className={`h-1.5 w-1.5 rounded-full ${
-                redisOk === null ? "bg-muted-foreground" : redisOk ? "bg-emerald-500" : "bg-amber-500"
-              }`}
-            />
-            {redisOk === null ? "Checking cache…" : redisOk ? "Redis cache: ok" : "Cache offline — Mongo fallback"}
-          </Badge>
+          <div className="flex items-center gap-3">
+            <Badge
+              variant="outline"
+              data-testid="topbar-status-pill"
+              className="hidden gap-1.5 rounded-full px-3 py-1 text-xs font-normal text-muted-foreground sm:inline-flex"
+            >
+              <span
+                className={`h-1.5 w-1.5 rounded-full ${
+                  redisOk === null ? "bg-muted-foreground" : redisOk ? "bg-emerald-500" : "bg-amber-500"
+                }`}
+              />
+              {redisOk === null ? "Checking cache…" : redisOk ? "Redis cache: ok" : "Cache offline — Mongo fallback"}
+            </Badge>
+            {user ? (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    data-testid="topbar-user-menu-trigger"
+                    className="rounded-full outline-none ring-ring focus-visible:ring-2"
+                    aria-label="Account menu"
+                  >
+                    <Avatar className="h-8 w-8 border">
+                      <AvatarImage src={user.picture || undefined} alt={user.name} />
+                      <AvatarFallback className="bg-accent text-accent-foreground text-xs font-medium">
+                        {user.name?.slice(0, 2).toUpperCase() || "ME"}
+                      </AvatarFallback>
+                    </Avatar>
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-56">
+                  <DropdownMenuLabel>
+                    <p className="text-sm font-medium" data-testid="topbar-user-name">{user.name}</p>
+                    <p className="truncate text-xs font-normal text-muted-foreground" data-testid="topbar-user-email">
+                      {user.email}
+                    </p>
+                  </DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onClick={handleLogout} data-testid="topbar-logout-button">
+                    <LogOut className="mr-2 h-4 w-4" /> Sign out
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ) : (
+              <Button size="sm" data-testid="topbar-signin-button" onClick={() => navigate("/auth")}>
+                <UserRound className="mr-1.5 h-4 w-4" /> Sign in
+              </Button>
+            )}
+          </div>
         </div>
       </header>
 
@@ -177,7 +263,8 @@ export default function HomePage() {
             Short links, <span className="text-primary">long reach.</span>
           </h1>
           <p className="mt-3 max-w-xl text-base text-muted-foreground sm:text-lg">
-            Paste a long URL, get a clean short link with click tracking. Powered by FastAPI, MongoDB and Redis.
+            Paste a long URL, get a clean short link with click tracking and a QR code.
+            {user ? " Your links are private to your account." : " Sign in to keep a private list of your links."}
           </p>
         </section>
 
@@ -275,6 +362,7 @@ export default function HomePage() {
                       >
                         <Copy className="mr-1.5 h-3.5 w-3.5" /> Copy
                       </Button>
+                      <QrDialog code={result.code} triggerTestId="shorten-result-qr-button" />
                       <Button
                         size="sm"
                         variant="ghost"
@@ -312,9 +400,23 @@ export default function HomePage() {
           </div>
         </div>
 
-        {/* Recent links */}
+        {/* Links */}
         <section className="mt-8">
-          <h2 className="font-heading text-xl font-semibold tracking-tight sm:text-2xl">Recent links</h2>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <h2 className="font-heading text-xl font-semibold tracking-tight sm:text-2xl" data-testid="links-section-title">
+              {user ? "My links" : "Recent links"}
+            </h2>
+            <div className="relative w-full sm:w-72">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                data-testid="links-search-input"
+                placeholder="Search by code or URL…"
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+                className="pl-9"
+              />
+            </div>
+          </div>
           <Card className="mt-4 rounded-xl">
             <CardContent className="p-0">
               {links === null ? (
@@ -325,17 +427,21 @@ export default function HomePage() {
                 </div>
               ) : links.length === 0 ? (
                 <div className="flex flex-col items-start gap-3 p-6 sm:p-8" data-testid="links-empty-state">
-                  <p className="font-heading text-lg font-medium">No links yet</p>
+                  <p className="font-heading text-lg font-medium">{debouncedQ ? "No matches" : "No links yet"}</p>
                   <p className="text-sm text-muted-foreground">
-                    Shorten your first URL above — it'll show up here with click counts.
+                    {debouncedQ
+                      ? `Nothing matched "${debouncedQ}". Try a different search.`
+                      : "Shorten your first URL above — it'll show up here with click counts."}
                   </p>
-                  <Button
-                    variant="outline"
-                    data-testid="links-empty-cta-button"
-                    onClick={() => document.getElementById("long-url")?.focus()}
-                  >
-                    Paste a URL
-                  </Button>
+                  {!debouncedQ && (
+                    <Button
+                      variant="outline"
+                      data-testid="links-empty-cta-button"
+                      onClick={() => document.getElementById("long-url")?.focus()}
+                    >
+                      Paste a URL
+                    </Button>
+                  )}
                 </div>
               ) : (
                 <>
@@ -401,6 +507,7 @@ export default function HomePage() {
                                 >
                                   <Copy className="h-4 w-4" />
                                 </Button>
+                                <QrDialog code={link.code} iconOnly triggerTestId="links-row-qr-button" />
                                 <DeleteButton code={link.code} onConfirm={handleDelete} />
                               </div>
                             </TableCell>
@@ -437,6 +544,7 @@ export default function HomePage() {
                             <Button size="icon" variant="ghost" aria-label="Copy" onClick={() => handleCopy(link.code)}>
                               <Copy className="h-4 w-4" />
                             </Button>
+                            <QrDialog code={link.code} iconOnly />
                             <DeleteButton code={link.code} onConfirm={handleDelete} />
                           </div>
                         </div>
@@ -447,6 +555,42 @@ export default function HomePage() {
               )}
             </CardContent>
           </Card>
+
+          {/* Pagination */}
+          {linksData && linksData.total > 0 && (
+            <div className="mt-4 flex items-center justify-between">
+              <p className="text-xs text-muted-foreground" data-testid="links-total-count">
+                {linksData.total} link{linksData.total === 1 ? "" : "s"}
+              </p>
+              {totalPages > 1 && (
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    data-testid="links-prev-page-button"
+                    disabled={page <= 1}
+                    onClick={() => setPage((p) => Math.max(1, p - 1))}
+                    aria-label="Previous page"
+                  >
+                    <ChevronLeft className="h-4 w-4" />
+                  </Button>
+                  <span className="text-sm text-muted-foreground" data-testid="links-page-indicator">
+                    Page {linksData.page} of {totalPages}
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    data-testid="links-next-page-button"
+                    disabled={page >= totalPages}
+                    onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                    aria-label="Next page"
+                  >
+                    <ChevronRight className="h-4 w-4" />
+                  </Button>
+                </div>
+              )}
+            </div>
+          )}
         </section>
 
         <footer className="mt-10 border-t pt-6 text-xs text-muted-foreground">
@@ -456,6 +600,66 @@ export default function HomePage() {
     </div>
   );
 }
+
+const QrDialog = ({ code, iconOnly = false, triggerTestId = "links-row-qr-button" }) => {
+  const [downloading, setDownloading] = useState(false);
+
+  const handleDownload = async () => {
+    setDownloading(true);
+    try {
+      const res = await fetch(qrUrlFor(code), { credentials: "include" });
+      if (!res.ok) throw new Error("fetch failed");
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `linkmint-${code}.png`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast.success("QR code downloaded");
+    } catch {
+      toast.error("Could not download QR code");
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  return (
+    <Dialog>
+      <DialogTrigger asChild>
+        {iconOnly ? (
+          <Button size="icon" variant="ghost" aria-label={`QR code for /${code}`} data-testid={triggerTestId}>
+            <QrCode className="h-4 w-4" />
+          </Button>
+        ) : (
+          <Button size="sm" variant="outline" data-testid={triggerTestId} aria-label={`QR code for /${code}`}>
+            <QrCode className="mr-1.5 h-3.5 w-3.5" /> QR
+          </Button>
+        )}
+      </DialogTrigger>
+      <DialogContent className="max-w-xs sm:max-w-sm" data-testid="qr-dialog">
+        <DialogHeader>
+          <DialogTitle className="font-heading tracking-tight">QR code for /{code}</DialogTitle>
+        </DialogHeader>
+        <div className="flex flex-col items-center gap-4">
+          <img
+            src={qrUrlFor(code)}
+            alt={`QR code linking to ${shortUrlFor(code)}`}
+            data-testid="qr-dialog-image"
+            className="h-56 w-56 rounded-lg border bg-white p-2"
+          />
+          <p className="font-mono text-xs text-muted-foreground">{shortUrlFor(code)}</p>
+          <Button onClick={handleDownload} disabled={downloading} className="w-full" data-testid="qr-dialog-download-button">
+            {downloading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Download className="mr-2 h-4 w-4" />}
+            Download PNG
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+};
 
 const DeleteButton = ({ code, onConfirm }) => (
   <AlertDialog>

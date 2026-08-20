@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -6,16 +6,22 @@ from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import re
 import json
+import math
 import random
 import string
+import secrets
 import logging
+from io import BytesIO
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 
+import bcrypt
+import httpx
+import qrcode
 import redis.asyncio as aioredis
 
 ROOT_DIR = Path(__file__).parent
@@ -37,6 +43,8 @@ redis_client = aioredis.from_url(
 )
 
 CACHE_TTL_SECONDS = 3600
+SESSION_TTL_DAYS = 7
+EMERGENT_SESSION_API = 'https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data'
 
 app = FastAPI(title='LinkMint URL Shortener')
 api_router = APIRouter(prefix='/api')
@@ -52,7 +60,11 @@ logger = logging.getLogger('linkmint')
 # ---------------------------------------------------------------------------
 BASE62 = string.ascii_letters + string.digits
 ALIAS_RE = re.compile(r'^[A-Za-z0-9_-]{3,32}$')
-RESERVED_CODES = {'api', 'app', 'static', 'admin', 'links', 'stats', 'health', 'assets'}
+EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+RESERVED_CODES = {
+    'api', 'app', 'static', 'admin', 'links', 'stats', 'health', 'assets',
+    'auth', 'qr', 'r', 'resolve', 'shorten', 'login', 'register', 'logout',
+}
 
 
 def generate_code(length: int = 6) -> str:
@@ -112,6 +124,75 @@ async def cache_delete(code: str):
 
 
 # ---------------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------------
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+    except Exception:
+        return False
+
+
+async def create_session(user_id: str) -> str:
+    token = secrets.token_urlsafe(48)
+    await db.user_sessions.insert_one({
+        'user_id': user_id,
+        'session_token': token,
+        'created_at': now_utc().isoformat(),
+        'expires_at': (now_utc() + timedelta(days=SESSION_TTL_DAYS)).isoformat(),
+    })
+    return token
+
+
+def set_session_cookie(response: Response, token: str):
+    response.set_cookie(
+        key='session_token',
+        value=token,
+        max_age=SESSION_TTL_DAYS * 24 * 3600,
+        httponly=True,
+        secure=True,
+        samesite='none',
+        path='/',
+    )
+
+
+def get_request_token(request: Request) -> Optional[str]:
+    token = request.cookies.get('session_token')
+    if not token:
+        auth_header = request.headers.get('Authorization', '')
+        if auth_header.startswith('Bearer '):
+            token = auth_header[7:]
+    return token or None
+
+
+async def get_current_user(request: Request) -> Optional[dict]:
+    """Returns user dict or None. Checks session_token cookie first, then Bearer header."""
+    token = get_request_token(request)
+    if not token:
+        return None
+    session = await db.user_sessions.find_one({'session_token': token}, {'_id': 0})
+    if not session:
+        return None
+    expires_at = parse_dt(session.get('expires_at'))
+    if expires_at is None or expires_at < now_utc():
+        await db.user_sessions.delete_one({'session_token': token})
+        return None
+    user = await db.users.find_one({'user_id': session['user_id']}, {'_id': 0, 'password_hash': 0})
+    return user
+
+
+async def require_user(request: Request) -> dict:
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail='Not authenticated')
+    return user
+
+
+# ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
 class LinkCreate(BaseModel):
@@ -130,6 +211,14 @@ class Link(BaseModel):
     created_at: str
     expires_at: Optional[str] = None
     is_expired: bool = False
+    owner_id: Optional[str] = None
+
+
+class PaginatedLinks(BaseModel):
+    items: List[Link]
+    total: int
+    page: int
+    pages: int
 
 
 class ResolveResponse(BaseModel):
@@ -148,6 +237,30 @@ class HealthResponse(BaseModel):
     redis: str
 
 
+class RegisterInput(BaseModel):
+    email: str
+    password: str
+    name: str
+
+
+class LoginInput(BaseModel):
+    email: str
+    password: str
+
+
+class SessionInput(BaseModel):
+    session_id: str
+
+
+class UserOut(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+
+    user_id: str
+    email: str
+    name: str
+    picture: Optional[str] = None
+
+
 def doc_to_link(doc: dict) -> Link:
     return Link(
         id=doc.get('id', str(uuid.uuid4())),
@@ -157,11 +270,131 @@ def doc_to_link(doc: dict) -> Link:
         created_at=doc.get('created_at', ''),
         expires_at=doc.get('expires_at'),
         is_expired=is_expired(doc.get('expires_at')),
+        owner_id=doc.get('owner_id'),
     )
 
 
+def scope_query(user: Optional[dict]) -> dict:
+    """Authenticated users see only their links; anonymous visitors see anonymous links."""
+    if user:
+        return {'owner_id': user['user_id']}
+    return {'owner_id': None}
+
+
 # ---------------------------------------------------------------------------
-# Routes
+# Auth routes
+# ---------------------------------------------------------------------------
+@api_router.post('/auth/register', response_model=UserOut)
+async def auth_register(payload: RegisterInput, response: Response):
+    email = payload.email.strip().lower()
+    name = payload.name.strip()
+    if not EMAIL_RE.match(email):
+        raise HTTPException(status_code=422, detail='Invalid email address')
+    if len(payload.password) < 6:
+        raise HTTPException(status_code=422, detail='Password must be at least 6 characters')
+    if not name:
+        raise HTTPException(status_code=422, detail='Name is required')
+
+    existing = await db.users.find_one({'email': email}, {'_id': 0})
+    if existing:
+        if existing.get('password_hash'):
+            raise HTTPException(status_code=409, detail='An account with this email already exists')
+        # Google-only account: link a password to it
+        await db.users.update_one(
+            {'user_id': existing['user_id']},
+            {'$set': {'password_hash': hash_password(payload.password), 'updated_at': now_utc().isoformat()}},
+        )
+        user = await db.users.find_one({'user_id': existing['user_id']}, {'_id': 0, 'password_hash': 0})
+    else:
+        user_id = f'user_{uuid.uuid4().hex[:12]}'
+        await db.users.insert_one({
+            'user_id': user_id,
+            'email': email,
+            'name': name,
+            'picture': None,
+            'password_hash': hash_password(payload.password),
+            'created_at': now_utc().isoformat(),
+        })
+        user = await db.users.find_one({'user_id': user_id}, {'_id': 0, 'password_hash': 0})
+
+    token = await create_session(user['user_id'])
+    set_session_cookie(response, token)
+    return UserOut(**user)
+
+
+@api_router.post('/auth/login', response_model=UserOut)
+async def auth_login(payload: LoginInput, response: Response):
+    email = payload.email.strip().lower()
+    user = await db.users.find_one({'email': email}, {'_id': 0})
+    if not user or not user.get('password_hash') or not verify_password(payload.password, user['password_hash']):
+        raise HTTPException(status_code=401, detail='Invalid email or password')
+    token = await create_session(user['user_id'])
+    set_session_cookie(response, token)
+    user.pop('password_hash', None)
+    return UserOut(**user)
+
+
+@api_router.post('/auth/session', response_model=UserOut)
+async def auth_session(payload: SessionInput, response: Response):
+    """Exchange Emergent OAuth session_id (from URL fragment) for a session token.
+    REMINDER: The session-data call MUST be made from the backend, never the frontend.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15) as http:
+            res = await http.get(EMERGENT_SESSION_API, headers={'X-Session-ID': payload.session_id})
+    except Exception:
+        raise HTTPException(status_code=502, detail='Could not reach authentication service')
+    if res.status_code != 200:
+        raise HTTPException(status_code=401, detail='Invalid or expired session')
+    data = res.json()
+    email = str(data.get('email', '')).strip().lower()
+    if not email:
+        raise HTTPException(status_code=401, detail='Authentication failed')
+
+    existing = await db.users.find_one({'email': email}, {'_id': 0})
+    if existing:
+        await db.users.update_one(
+            {'user_id': existing['user_id']},
+            {'$set': {
+                'name': data.get('name') or existing.get('name') or email,
+                'picture': data.get('picture') or existing.get('picture'),
+                'updated_at': now_utc().isoformat(),
+            }},
+        )
+        user_id = existing['user_id']
+    else:
+        user_id = f'user_{uuid.uuid4().hex[:12]}'
+        await db.users.insert_one({
+            'user_id': user_id,
+            'email': email,
+            'name': data.get('name') or email,
+            'picture': data.get('picture'),
+            'created_at': now_utc().isoformat(),
+        })
+
+    token = await create_session(user_id)
+    set_session_cookie(response, token)
+    user = await db.users.find_one({'user_id': user_id}, {'_id': 0, 'password_hash': 0})
+    return UserOut(**user)
+
+
+@api_router.get('/auth/me', response_model=UserOut)
+async def auth_me(request: Request):
+    user = await require_user(request)
+    return UserOut(**user)
+
+
+@api_router.post('/auth/logout')
+async def auth_logout(request: Request, response: Response):
+    token = get_request_token(request)
+    if token:
+        await db.user_sessions.delete_one({'session_token': token})
+    response.delete_cookie('session_token', path='/')
+    return {'logged_out': True}
+
+
+# ---------------------------------------------------------------------------
+# App routes
 # ---------------------------------------------------------------------------
 @api_router.get('/')
 async def root():
@@ -184,7 +417,8 @@ async def health():
 
 
 @api_router.post('/shorten', response_model=Link)
-async def shorten(payload: LinkCreate):
+async def shorten(payload: LinkCreate, request: Request):
+    user = await get_current_user(request)
     try:
         url = normalize_url(payload.url)
     except ValueError as e:
@@ -231,39 +465,87 @@ async def shorten(payload: LinkCreate):
         'clicks': 0,
         'created_at': now_utc().isoformat(),
         'expires_at': expires_at,
+        'owner_id': user['user_id'] if user else None,
     }
     await db.links.insert_one(dict(doc))
     await cache_set(code, {'url': url, 'expires_at': expires_at})
-    logger.info('Shortened %s -> %s', url[:80], code)
+    logger.info('Shortened %s -> %s (owner=%s)', url[:80], code, doc['owner_id'])
     return doc_to_link(doc)
 
 
-@api_router.get('/links', response_model=List[Link])
-async def list_links(limit: int = 100):
-    docs = await db.links.find({}, {'_id': 0}).sort('created_at', -1).to_list(min(limit, 500))
-    return [doc_to_link(d) for d in docs]
+@api_router.get('/links', response_model=PaginatedLinks)
+async def list_links(request: Request, q: str = '', page: int = 1, limit: int = 25):
+    user = await get_current_user(request)
+    query = scope_query(user)
+    q = q.strip()
+    if q:
+        rx = {'$regex': re.escape(q), '$options': 'i'}
+        query = {'$and': [query, {'$or': [{'code': rx}, {'url': rx}]}]}
+    limit = max(1, min(limit, 100))
+    page = max(1, page)
+    total = await db.links.count_documents(query)
+    pages = max(1, math.ceil(total / limit))
+    page = min(page, pages)
+    docs = (
+        await db.links.find(query, {'_id': 0})
+        .sort('created_at', -1)
+        .skip((page - 1) * limit)
+        .to_list(limit)
+    )
+    return PaginatedLinks(items=[doc_to_link(d) for d in docs], total=total, page=page, pages=pages)
 
 
 @api_router.get('/stats', response_model=StatsResponse)
-async def stats():
-    total_links = await db.links.count_documents({})
-    pipeline = [{'$group': {'_id': None, 'clicks': {'$sum': '$clicks'}}}]
+async def stats(request: Request):
+    user = await get_current_user(request)
+    base = scope_query(user)
+    total_links = await db.links.count_documents(base)
+    pipeline = [{'$match': base}, {'$group': {'_id': None, 'clicks': {'$sum': '$clicks'}}}]
     agg = await db.links.aggregate(pipeline).to_list(1)
     total_clicks = int(agg[0]['clicks']) if agg else 0
     now_iso = now_utc().isoformat()
     active_links = await db.links.count_documents({
-        '$or': [{'expires_at': None}, {'expires_at': {'$gt': now_iso}}]
+        '$and': [base, {'$or': [{'expires_at': None}, {'expires_at': {'$gt': now_iso}}]}]
     })
     return StatsResponse(total_links=total_links, total_clicks=total_clicks, active_links=active_links)
 
 
 @api_router.delete('/links/{code}')
-async def delete_link(code: str):
-    result = await db.links.delete_one({'code': code})
-    if result.deleted_count == 0:
+async def delete_link(code: str, request: Request):
+    user = await get_current_user(request)
+    doc = await db.links.find_one({'code': code}, {'_id': 0})
+    if not doc:
         raise HTTPException(status_code=404, detail='Link not found')
+    owner_id = doc.get('owner_id')
+    if owner_id is not None and (not user or user['user_id'] != owner_id):
+        raise HTTPException(status_code=403, detail='You do not own this link')
+    await db.links.delete_one({'code': code})
     await cache_delete(code)
     return {'deleted': True, 'code': code}
+
+
+@api_router.get('/qr/{code}')
+async def qr_image(code: str, request: Request):
+    doc = await db.links.find_one({'code': code}, {'_id': 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail='Link not found')
+    proto = request.headers.get('x-forwarded-proto', 'https').split(',')[0].strip()
+    host = request.headers.get('x-forwarded-host') or request.headers.get('host', 'localhost')
+    short_url = f'{proto}://{host}/{code}'
+    qr = qrcode.QRCode(box_size=10, border=2)
+    qr.add_data(short_url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color='black', back_color='white')
+    buf = BytesIO()
+    img.save(buf, format='PNG')
+    return Response(
+        content=buf.getvalue(),
+        media_type='image/png',
+        headers={
+            'Cache-Control': 'public, max-age=300',
+            'Content-Disposition': f'inline; filename="linkmint-{code}.png"',
+        },
+    )
 
 
 async def _resolve_code(code: str) -> str:
@@ -313,6 +595,10 @@ async def startup():
     try:
         await db.links.create_index('code', unique=True)
         await db.links.create_index('created_at')
+        await db.links.create_index('owner_id')
+        await db.users.create_index('email', unique=True)
+        await db.users.create_index('user_id', unique=True)
+        await db.user_sessions.create_index('session_token', unique=True)
     except Exception as e:
         logger.warning('Index creation failed: %s', e)
     try:

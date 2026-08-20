@@ -1,0 +1,192 @@
+import { useEffect, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
+import { toast } from "sonner";
+import { Link2, Loader2, ArrowLeft } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Separator } from "@/components/ui/separator";
+import { loginUser, registerUser } from "@/lib/api";
+import { useAuth } from "@/context/AuthContext";
+
+const GoogleIcon = () => (
+  <svg className="mr-2 h-4 w-4" viewBox="0 0 24 24" aria-hidden="true">
+    <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.27-4.74 3.27-8.1z" />
+    <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84A11 11 0 0 0 12 23z" />
+    <path fill="#FBBC05" d="M5.84 14.1a6.6 6.6 0 0 1 0-4.2V7.06H2.18a11 11 0 0 0 0 9.88l3.66-2.84z" />
+    <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15A11 11 0 0 0 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z" />
+  </svg>
+);
+
+export default function AuthPage() {
+  const navigate = useNavigate();
+  const { user, setUser, loading } = useAuth();
+  const [submitting, setSubmitting] = useState(false);
+  const [loginForm, setLoginForm] = useState({ email: "", password: "" });
+  const [registerForm, setRegisterForm] = useState({ name: "", email: "", password: "" });
+
+  useEffect(() => {
+    if (!loading && user) navigate("/", { replace: true });
+  }, [user, loading, navigate]);
+
+  const handleGoogle = () => {
+    // REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
+    const redirectUrl = window.location.origin + "/";
+    window.location.href = `https://auth.emergentagent.com/?redirect=${encodeURIComponent(redirectUrl)}`;
+  };
+
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    setSubmitting(true);
+    try {
+      const res = await loginUser(loginForm);
+      setUser(res.data);
+      toast.success(`Welcome back, ${res.data.name}`);
+      navigate("/", { replace: true });
+    } catch (err) {
+      const detail = err?.response?.data?.detail;
+      toast.error(typeof detail === "string" ? detail : "Sign-in failed");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleRegister = async (e) => {
+    e.preventDefault();
+    setSubmitting(true);
+    try {
+      const res = await registerUser(registerForm);
+      setUser(res.data);
+      toast.success(`Welcome, ${res.data.name}`);
+      navigate("/", { replace: true });
+    } catch (err) {
+      const detail = err?.response?.data?.detail;
+      toast.error(typeof detail === "string" ? detail : "Could not create account");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="hero-mesh flex min-h-screen items-center justify-center bg-background px-4 py-10">
+      <div className="w-full max-w-md">
+        <Link to="/" data-testid="auth-back-home-link" className="mb-6 inline-flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground">
+          <ArrowLeft className="h-4 w-4" /> Back to LinkMint
+        </Link>
+        <Card className="rounded-xl shadow-[0_1px_0_rgba(15,23,42,0.04),0_10px_30px_rgba(15,23,42,0.06)]">
+          <CardHeader className="space-y-2 pb-4">
+            <span className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary text-primary-foreground">
+              <Link2 className="h-5 w-5" />
+            </span>
+            <CardTitle className="font-heading text-2xl tracking-tight">Your links, your account</CardTitle>
+            <p className="text-sm text-muted-foreground">
+              Sign in to keep a private list of short links with click tracking.
+            </p>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <Button
+              variant="outline"
+              className="w-full"
+              data-testid="google-signin-button"
+              onClick={handleGoogle}
+            >
+              <GoogleIcon /> Continue with Google
+            </Button>
+            <div className="flex items-center gap-3">
+              <Separator className="flex-1" />
+              <span className="text-xs text-muted-foreground">or with email</span>
+              <Separator className="flex-1" />
+            </div>
+            <Tabs defaultValue="login">
+              <TabsList className="grid w-full grid-cols-2">
+                <TabsTrigger value="login" data-testid="auth-login-tab">Sign in</TabsTrigger>
+                <TabsTrigger value="register" data-testid="auth-register-tab">Create account</TabsTrigger>
+              </TabsList>
+              <TabsContent value="login" className="mt-4">
+                <form onSubmit={handleLogin} className="space-y-3">
+                  <div className="space-y-1.5">
+                    <Label htmlFor="login-email">Email</Label>
+                    <Input
+                      id="login-email"
+                      type="email"
+                      required
+                      data-testid="login-email-input"
+                      placeholder="you@example.com"
+                      value={loginForm.email}
+                      onChange={(e) => setLoginForm({ ...loginForm, email: e.target.value })}
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="login-password">Password</Label>
+                    <Input
+                      id="login-password"
+                      type="password"
+                      required
+                      data-testid="login-password-input"
+                      placeholder="••••••••"
+                      value={loginForm.password}
+                      onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
+                    />
+                  </div>
+                  <Button type="submit" className="w-full" disabled={submitting} data-testid="login-submit-button">
+                    {submitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                    Sign in
+                  </Button>
+                </form>
+              </TabsContent>
+              <TabsContent value="register" className="mt-4">
+                <form onSubmit={handleRegister} className="space-y-3">
+                  <div className="space-y-1.5">
+                    <Label htmlFor="register-name">Name</Label>
+                    <Input
+                      id="register-name"
+                      required
+                      data-testid="register-name-input"
+                      placeholder="Ada Lovelace"
+                      value={registerForm.name}
+                      onChange={(e) => setRegisterForm({ ...registerForm, name: e.target.value })}
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="register-email">Email</Label>
+                    <Input
+                      id="register-email"
+                      type="email"
+                      required
+                      data-testid="register-email-input"
+                      placeholder="you@example.com"
+                      value={registerForm.email}
+                      onChange={(e) => setRegisterForm({ ...registerForm, email: e.target.value })}
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="register-password">Password</Label>
+                    <Input
+                      id="register-password"
+                      type="password"
+                      required
+                      minLength={6}
+                      data-testid="register-password-input"
+                      placeholder="At least 6 characters"
+                      value={registerForm.password}
+                      onChange={(e) => setRegisterForm({ ...registerForm, password: e.target.value })}
+                    />
+                  </div>
+                  <Button type="submit" className="w-full" disabled={submitting} data-testid="register-submit-button">
+                    {submitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                    Create account
+                  </Button>
+                </form>
+              </TabsContent>
+            </Tabs>
+            <p className="text-xs text-muted-foreground">
+              You can still shorten links without an account — signing in keeps them private to you.
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
