@@ -1,0 +1,35 @@
+# Slim dependency set for running LinkMint locally.
+#
+# backend/requirements.txt is a frozen snapshot of the Emergent cloud image: it
+# pins ~150 packages, including a litellm wheel served from a private
+# customer-assets URL and `emergentintegrations`, neither of which resolves from
+# a normal machine. None of that is imported by server.py.
+#
+# This file lists only what backend/server.py + backend_test.py actually need.
+
+# --- web framework -------------------------------------------------------
+fastapi==0.110.1
+starlette==0.37.2
+uvicorn[standard]==0.25.0
+pydantic>=2.6,<3
+python-dotenv>=1.0
+
+# --- datastores ----------------------------------------------------------
+motor==3.3.1
+pymongo==4.6.3
+redis>=5.0
+
+# --- auth / crypto -------------------------------------------------------
+bcrypt>=4.1,<5
+email-validator>=2.1
+
+# --- outbound http (Emergent OAuth session exchange) ---------------------
+httpx>=0.27
+
+# --- QR codes ------------------------------------------------------------
+qrcode>=7.4
+pillow>=10
+
+# --- test suite ----------------------------------------------------------
+requests>=2.31
+pytest>=8.0

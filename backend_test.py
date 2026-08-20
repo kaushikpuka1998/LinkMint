@@ -9,7 +9,10 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple
 
-BASE_URL = "https://go-shortlink.preview.emergentagent.com/api"
+import os
+
+# Point at any deployment with LINKMINT_BASE_URL=https://your-host/api
+BASE_URL = os.environ.get("LINKMINT_BASE_URL", "http://localhost:8001/api").rstrip("/")
 
 class Colors:
     GREEN = '\033[92m'

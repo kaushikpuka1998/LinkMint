@@ -1,0 +1,38 @@
+# Local datastores for LinkMint. Nothing else runs in Docker — the backend and
+# frontend run on the host so hot reload works normally.
+#
+#   docker compose -f docker-compose.local.yml up -d
+#   docker compose -f docker-compose.local.yml down          # stop
+#   docker compose -f docker-compose.local.yml down -v       # stop + wipe data
+
+name: linkmint-local
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: linkmint-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - linkmint-mongo-data:/data/db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: linkmint-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  linkmint-mongo-data:

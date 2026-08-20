@@ -21,7 +21,6 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 
 import bcrypt
-import httpx
 import qrcode
 import redis.asyncio as aioredis
 
@@ -45,7 +44,14 @@ redis_client = aioredis.from_url(
 
 CACHE_TTL_SECONDS = 3600
 SESSION_TTL_DAYS = 7
-EMERGENT_SESSION_API = 'https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data'
+
+# Session cookie flags. Production is served over HTTPS from a different origin
+# than the frontend, so it needs Secure + SameSite=None. Browsers refuse to
+# store a Secure cookie on http://localhost, which silently breaks sign-in in
+# local dev, so these are overridable via the environment. Defaults preserve
+# the production behaviour.
+COOKIE_SECURE = os.environ.get('COOKIE_SECURE', 'true').strip().lower() not in ('false', '0', 'no')
+COOKIE_SAMESITE = os.environ.get('COOKIE_SAMESITE', 'none').strip().lower()
 
 app = FastAPI(title='LinkMint URL Shortener')
 api_router = APIRouter(prefix='/api')
@@ -248,8 +254,8 @@ def set_session_cookie(response: Response, token: str):
         value=token,
         max_age=SESSION_TTL_DAYS * 24 * 3600,
         httponly=True,
-        secure=True,
-        samesite='none',
+        secure=COOKIE_SECURE,
+        samesite=COOKIE_SAMESITE,
         path='/',
     )
 
@@ -378,10 +384,6 @@ class LoginInput(BaseModel):
     password: str
 
 
-class SessionInput(BaseModel):
-    session_id: str
-
-
 class UserOut(BaseModel):
     model_config = ConfigDict(extra='ignore')
 
@@ -462,50 +464,6 @@ async def auth_login(payload: LoginInput, response: Response):
     token = await create_session(user['user_id'])
     set_session_cookie(response, token)
     user.pop('password_hash', None)
-    return UserOut(**user)
-
-
-@api_router.post('/auth/session', response_model=UserOut)
-async def auth_session(payload: SessionInput, response: Response):
-    """Exchange Emergent OAuth session_id (from URL fragment) for a session token.
-    REMINDER: The session-data call MUST be made from the backend, never the frontend.
-    """
-    try:
-        async with httpx.AsyncClient(timeout=15) as http:
-            res = await http.get(EMERGENT_SESSION_API, headers={'X-Session-ID': payload.session_id})
-    except Exception:
-        raise HTTPException(status_code=502, detail='Could not reach authentication service')
-    if res.status_code != 200:
-        raise HTTPException(status_code=401, detail='Invalid or expired session')
-    data = res.json()
-    email = str(data.get('email', '')).strip().lower()
-    if not email:
-        raise HTTPException(status_code=401, detail='Authentication failed')
-
-    existing = await db.users.find_one({'email': email}, {'_id': 0})
-    if existing:
-        await db.users.update_one(
-            {'user_id': existing['user_id']},
-            {'$set': {
-                'name': data.get('name') or existing.get('name') or email,
-                'picture': data.get('picture') or existing.get('picture'),
-                'updated_at': now_utc().isoformat(),
-            }},
-        )
-        user_id = existing['user_id']
-    else:
-        user_id = f'user_{uuid.uuid4().hex[:12]}'
-        await db.users.insert_one({
-            'user_id': user_id,
-            'email': email,
-            'name': data.get('name') or email,
-            'picture': data.get('picture'),
-            'created_at': now_utc().isoformat(),
-        })
-
-    token = await create_session(user_id)
-    set_session_cookie(response, token)
-    user = await db.users.find_one({'user_id': user_id}, {'_id': 0, 'password_hash': 0})
     return UserOut(**user)
 
 
