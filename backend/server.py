@@ -11,6 +11,7 @@ import random
 import string
 import secrets
 import logging
+import time
 from io import BytesIO
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
@@ -121,6 +122,71 @@ async def cache_delete(code: str):
         await redis_client.delete(f'link:{code}')
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting (anonymous link creation)
+# Redis-backed fixed-window counters with in-memory fallback if Redis is down.
+# ---------------------------------------------------------------------------
+ANON_RATE_LIMITS = [
+    ('min', 60, int(os.environ.get('ANON_LIMIT_PER_MIN', '10'))),
+    ('hour', 3600, int(os.environ.get('ANON_LIMIT_PER_HOUR', '100'))),
+]
+_memory_buckets: dict = {}
+
+
+def get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get('x-forwarded-for', '')
+    if forwarded:
+        return forwarded.split(',')[0].strip()
+    return request.client.host if request.client else 'unknown'
+
+
+def _human_wait(seconds: int) -> str:
+    if seconds >= 120:
+        return f'{seconds // 60} minutes'
+    if seconds > 60:
+        return 'a couple of minutes'
+    return f'{max(1, seconds)} seconds'
+
+
+async def enforce_anon_rate_limit(request: Request):
+    """Raise 429 if an anonymous visitor exceeds creation limits for their IP."""
+    ip = get_client_ip(request)
+    for suffix, ttl, cap in ANON_RATE_LIMITS:
+        key = f'rl:shorten:{ip}:{suffix}'
+        count = None
+        retry_after = ttl
+        try:
+            count = await redis_client.incr(key)
+            if count == 1:
+                await redis_client.expire(key, ttl)
+            if count > cap:
+                try:
+                    retry_after = max(1, await redis_client.ttl(key))
+                except Exception:
+                    retry_after = ttl
+        except Exception:
+            # In-memory fixed-window fallback (per-process)
+            now = time.time()
+            bucket = _memory_buckets.get(key)
+            if not bucket or now >= bucket['reset']:
+                bucket = {'count': 0, 'reset': now + ttl}
+                _memory_buckets[key] = bucket
+            bucket['count'] += 1
+            count = bucket['count']
+            retry_after = max(1, int(bucket['reset'] - now))
+        if count > cap:
+            logger.warning('Rate limit hit (%s window) for ip=%s', suffix, ip)
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f'Slow down! Anonymous visitors can create up to {cap} links per '
+                    f'{"minute" if suffix == "min" else "hour"}. '
+                    f'Try again in {_human_wait(retry_after)}, or sign in for unlimited shortening.'
+                ),
+                headers={'Retry-After': str(retry_after)},
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +485,8 @@ async def health():
 @api_router.post('/shorten', response_model=Link)
 async def shorten(payload: LinkCreate, request: Request):
     user = await get_current_user(request)
+    if not user:
+        await enforce_anon_rate_limit(request)
     try:
         url = normalize_url(payload.url)
     except ValueError as e:

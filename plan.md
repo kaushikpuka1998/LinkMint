@@ -1,7 +1,7 @@
 # plan.md — LinkMint (URL Shortener)
 
 ## 1) Objectives
-- **Status: Phases 1–4 Delivered (Production-ready MVP + Accounts/Search/QR).** Maintain and extend the working full-stack URL shortener: **FastAPI + React (shadcn/ui) + MongoDB + Redis**.
+- **Status: Phases 1–5 Delivered (Production-ready URL shortener + Accounts + Search/QR + Abuse Protection).** Maintain and extend the working full-stack URL shortener: **FastAPI + React (shadcn/ui) + MongoDB + Redis**.
 - Preserve core flow reliability: **shorten → resolve/redirect → click count → list/manage links**.
 - Use Redis to accelerate resolve operations via caching, with **graceful MongoDB fallback** when Redis is unavailable.
 - Provide **User Accounts** with **both** authentication methods:
@@ -10,6 +10,7 @@
 - Keep **anonymous shortening allowed**; authentication unlocks **“My Links”** (owner-scoped management).
 - Provide **QR codes** (simple black-and-white PNG) per short link with download.
 - Provide **Link Search + Pagination** so large link lists remain usable.
+- Provide **Anonymous Rate Limiting** for abuse protection (per-IP caps) while keeping signed-in experience frictionless.
 - Maintain a polished, responsive UI aligned to `design_guidelines.md`, with consistent **`data-testid`** attributes for automation.
 
 ---
@@ -193,8 +194,39 @@ Backend dependencies in use:
 
 ---
 
+### Phase 5 — Anonymous Rate Limiting (Abuse Protection)
+**Goal:** Protect the public shortener from abuse by capping anonymous create throughput, while keeping signed-in users frictionless.
+
+**Status: COMPLETED**
+
+Implementation (in `/app/backend/server.py`):
+- `enforce_anon_rate_limit()` applied in **`POST /api/shorten` only for anonymous requests** (signed-in users bypass).
+- Limits enforced **per client IP**:
+  - **10 links / minute**
+  - **100 links / hour**
+- Configurable via env vars:
+  - `ANON_LIMIT_PER_MIN` (default 10)
+  - `ANON_LIMIT_PER_HOUR` (default 100)
+- Client IP extraction:
+  - uses `x-forwarded-for` (first hop) else `request.client.host`.
+- Storage strategy:
+  - Redis fixed-window counters (INCR + EXPIRE) using keys: `rl:shorten:{ip}:{min|hour}`
+  - In-memory per-process fallback when Redis is down
+- Response behavior:
+  - HTTP **429** with friendly `detail` message (includes suggestion to sign in)
+  - `Retry-After` header set with seconds until reset
+
+Verification (manual curl tests):
+- Anonymous burst: 200 × 10 then **429** at request 11/12 with correct message + `Retry-After`.
+- Different IP unaffected.
+- Authenticated user can create 12+ links without rate limiting.
+- Redis stopped: in-memory fallback still enforces 429 at request 11; resolve and overall app remain functional; Redis restarted successfully.
+- Test data cleanup performed (removed generated test links).
+
+---
+
 ## 3) Next Actions
-**Current status: All planned phases complete.** Next actions are optional enhancements.
+**Current status: All planned phases (1–5) complete.** Next actions are optional enhancements.
 
 1) **Analytics (Optional)**
 - Add click trend charts (Recharts) and per-link analytics page.
@@ -204,7 +236,10 @@ Backend dependencies in use:
 
 3) **Operational Hardening (Optional)**
 - Add Redis auto-start strategy (if permitted) or health-based auto-disable messaging.
-- Add rate limiting/abuse protection.
+- Consider rate-limit extensions:
+  - Separate limits for anonymous vs authenticated (already: authed bypass)
+  - Per-user limits for extreme abuse
+  - Global circuit-breaker if DB under load
 
 4) **Testing/Regression (Ongoing)**
 - Keep `/app/backend_test.py` as a regression suite.
@@ -228,3 +263,9 @@ Backend dependencies in use:
 - Links list supports search + pagination with stable totals.
 - Each link supports QR code view + download (PNG, black-and-white).
 - Full E2E verification passes (`/app/test_reports/iteration_2.json`).
+
+### Phase 5 (met)
+- Anonymous link creation is capped per IP (minute + hour windows).
+- Rate limiting returns 429 + `Retry-After` and clear messaging.
+- Signed-in users are not rate-limited by the anonymous caps.
+- Rate limiting remains functional even if Redis is down (fallback mode).
