@@ -20,6 +20,8 @@ import {
   Download,
   LogOut,
   UserRound,
+  Tag,
+  FileDown,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -62,8 +64,9 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
-import { shortenUrl, getLinks, getStats, getHealth, deleteLink, shortUrlFor, qrUrlFor } from "@/lib/api";
+import { shortenUrl, getLinks, getStats, getHealth, deleteLink, shortUrlFor, qrUrlFor, getTags, exportLinksCsv } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
+import { ThemeToggle } from "@/components/ThemeToggle";
 
 const PAGE_SIZE = 10;
 
@@ -90,6 +93,7 @@ export default function HomePage() {
   const [longUrl, setLongUrl] = useState("");
   const [alias, setAlias] = useState("");
   const [expiry, setExpiry] = useState(null);
+  const [tagsText, setTagsText] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState(null);
   const [linksData, setLinksData] = useState(null); // {items, total, page, pages}
@@ -98,6 +102,9 @@ export default function HomePage() {
   const [q, setQ] = useState("");
   const [debouncedQ, setDebouncedQ] = useState("");
   const [page, setPage] = useState(1);
+  const [tagFilter, setTagFilter] = useState("");
+  const [availableTags, setAvailableTags] = useState([]);
+  const [exporting, setExporting] = useState(false);
 
   useEffect(() => {
     const t = setTimeout(() => {
@@ -109,17 +116,19 @@ export default function HomePage() {
 
   const refresh = useCallback(async () => {
     try {
-      const [linksRes, statsRes] = await Promise.all([
-        getLinks({ q: debouncedQ, page, limit: PAGE_SIZE }),
+      const [linksRes, statsRes, tagsRes] = await Promise.all([
+        getLinks({ q: debouncedQ, tag: tagFilter, page, limit: PAGE_SIZE }),
         getStats(),
+        getTags(),
       ]);
       setLinksData(linksRes.data);
       setStats(statsRes.data);
+      setAvailableTags(tagsRes.data);
     } catch {
       setLinksData((prev) => prev ?? { items: [], total: 0, page: 1, pages: 1 });
       toast.error("Could not load links");
     }
-  }, [debouncedQ, page]);
+  }, [debouncedQ, tagFilter, page]);
 
   useEffect(() => {
     refresh();
@@ -141,6 +150,9 @@ export default function HomePage() {
     try {
       const payload = { url: longUrl.trim() };
       if (alias.trim()) payload.custom_alias = alias.trim();
+      if (user && tagsText.trim()) {
+        payload.tags = tagsText.split(",").map((t) => t.trim()).filter(Boolean);
+      }
       if (expiry) {
         const end = new Date(expiry);
         end.setHours(23, 59, 59, 999);
@@ -162,7 +174,28 @@ export default function HomePage() {
     setLongUrl("");
     setAlias("");
     setExpiry(null);
+    setTagsText("");
     setResult(null);
+  };
+
+  const handleExport = async () => {
+    setExporting(true);
+    try {
+      const res = await exportLinksCsv({ q: debouncedQ, tag: tagFilter });
+      const url = URL.createObjectURL(res.data);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `linkmint-links-${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast.success("CSV exported");
+    } catch {
+      toast.error("Could not export CSV");
+    } finally {
+      setExporting(false);
+    }
   };
 
   const handleCopy = async (code) => {
@@ -209,7 +242,7 @@ export default function HomePage() {
             </span>
             <span className="font-heading text-lg font-semibold tracking-tight">LinkMint</span>
           </a>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
             <Badge
               variant="outline"
               data-testid="topbar-status-pill"
@@ -222,6 +255,7 @@ export default function HomePage() {
               />
               {redisOk === null ? "Checking cache…" : redisOk ? "Redis cache: ok" : "Cache offline — Mongo fallback"}
             </Badge>
+            <ThemeToggle />
             {user ? (
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
@@ -338,6 +372,18 @@ export default function HomePage() {
                     </Popover>
                   </div>
                 </div>
+                {user && (
+                  <div className="space-y-2">
+                    <Label htmlFor="single-tags">Tags (optional, comma separated)</Label>
+                    <Input
+                      id="single-tags"
+                      data-testid="shorten-form-tags-input"
+                      placeholder="marketing, launch"
+                      value={tagsText}
+                      onChange={(e) => setTagsText(e.target.value)}
+                    />
+                  </div>
+                )}
                 <div className="flex items-center gap-2 pt-1">
                   <Button
                     type="submit"
@@ -421,17 +467,68 @@ export default function HomePage() {
             <h2 className="font-heading text-xl font-semibold tracking-tight sm:text-2xl" data-testid="links-section-title">
               {user ? "My links" : "Recent links"}
             </h2>
-            <div className="relative w-full sm:w-72">
-              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                data-testid="links-search-input"
-                placeholder="Search by code or URL…"
-                value={q}
-                onChange={(e) => setQ(e.target.value)}
-                className="pl-9"
-              />
+            <div className="flex w-full items-center gap-2 sm:w-auto">
+              <div className="relative flex-1 sm:w-64">
+                <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  data-testid="links-search-input"
+                  placeholder="Search by code or URL…"
+                  value={q}
+                  onChange={(e) => setQ(e.target.value)}
+                  className="pl-9"
+                />
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                data-testid="links-export-csv-button"
+                onClick={handleExport}
+                disabled={exporting || !linksData || linksData.total === 0}
+                className="shrink-0"
+              >
+                {exporting ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <FileDown className="mr-1.5 h-3.5 w-3.5" />}
+                CSV
+              </Button>
             </div>
           </div>
+          {availableTags.length > 0 && (
+            <div className="mt-3 flex flex-wrap items-center gap-1.5" data-testid="links-tag-filter">
+              <Tag className="h-3.5 w-3.5 text-muted-foreground" />
+              <button
+                type="button"
+                data-testid="tag-filter-all"
+                onClick={() => {
+                  setTagFilter("");
+                  setPage(1);
+                }}
+                className={`rounded-full border px-2.5 py-0.5 text-xs transition-colors ${
+                  tagFilter === ""
+                    ? "border-primary bg-primary text-primary-foreground"
+                    : "border-border bg-card text-muted-foreground hover:border-primary/40 hover:text-foreground"
+                }`}
+              >
+                All
+              </button>
+              {availableTags.map((t) => (
+                <button
+                  key={t}
+                  type="button"
+                  data-testid={`tag-filter-${t}`}
+                  onClick={() => {
+                    setTagFilter(tagFilter === t ? "" : t);
+                    setPage(1);
+                  }}
+                  className={`rounded-full border px-2.5 py-0.5 text-xs transition-colors ${
+                    tagFilter === t
+                      ? "border-primary bg-primary text-primary-foreground"
+                      : "border-border bg-card text-muted-foreground hover:border-primary/40 hover:text-foreground"
+                  }`}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+          )}
           <Card className="mt-4 rounded-xl">
             <CardContent className="p-0">
               {links === null ? (
@@ -491,6 +588,24 @@ export default function HomePage() {
                               <span className="block truncate font-mono text-xs text-muted-foreground" title={link.url}>
                                 {truncate(link.url)}
                               </span>
+                              {link.tags?.length > 0 && (
+                                <span className="mt-1 flex flex-wrap gap-1">
+                                  {link.tags.map((t) => (
+                                    <button
+                                      key={t}
+                                      type="button"
+                                      data-testid={`links-row-tag-${link.code}-${t}`}
+                                      onClick={() => {
+                                        setTagFilter(t);
+                                        setPage(1);
+                                      }}
+                                      className="rounded-full bg-accent px-2 py-0 text-[10px] text-accent-foreground hover:bg-accent/70"
+                                    >
+                                      {t}
+                                    </button>
+                                  ))}
+                                </span>
+                              )}
                             </TableCell>
                             <TableCell className="text-right">
                               <Badge variant="secondary" data-testid={`links-row-clicks-${link.code}`}>
@@ -549,6 +664,15 @@ export default function HomePage() {
                           <Badge variant="secondary">{link.clicks} clicks</Badge>
                         </div>
                         <p className="mt-1 truncate font-mono text-xs text-muted-foreground">{link.url}</p>
+                        {link.tags?.length > 0 && (
+                          <div className="mt-1 flex flex-wrap gap-1">
+                            {link.tags.map((t) => (
+                              <span key={t} className="rounded-full bg-accent px-2 py-0 text-[10px] text-accent-foreground">
+                                {t}
+                              </span>
+                            ))}
+                          </div>
+                        )}
                         <div className="mt-2 flex items-center justify-between">
                           <span className="text-xs text-muted-foreground">
                             {link.expires_at

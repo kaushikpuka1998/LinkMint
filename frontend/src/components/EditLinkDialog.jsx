@@ -14,6 +14,7 @@ export const EditLinkDialog = ({ link, onSaved }) => {
   const [open, setOpen] = useState(false);
   const [url, setUrl] = useState(link.url);
   const [expiry, setExpiry] = useState(link.expires_at ? new Date(link.expires_at) : null);
+  const [tagsText, setTagsText] = useState((link.tags || []).join(", "));
   const [clearExpiry, setClearExpiry] = useState(false);
   const [saving, setSaving] = useState(false);
 
@@ -22,6 +23,7 @@ export const EditLinkDialog = ({ link, onSaved }) => {
     if (next) {
       setUrl(link.url);
       setExpiry(link.expires_at ? new Date(link.expires_at) : null);
+      setTagsText((link.tags || []).join(", "));
       setClearExpiry(false);
     }
   };
@@ -39,6 +41,8 @@ export const EditLinkDialog = ({ link, onSaved }) => {
         const iso = end.toISOString();
         if (iso !== link.expires_at) payload.expires_at = iso;
       }
+      const parsedTags = tagsText.split(",").map((t) => t.trim()).filter(Boolean);
+      if (parsedTags.join("|") !== (link.tags || []).join("|")) payload.tags = parsedTags;
       if (Object.keys(payload).length === 0) {
         toast.info("Nothing to update");
         setSaving(false);
@@ -133,6 +137,16 @@ export const EditLinkDialog = ({ link, onSaved }) => {
                 </Button>
               )}
             </div>
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor={`edit-tags-${link.code}`}>Tags (comma separated, max 5)</Label>
+            <Input
+              id={`edit-tags-${link.code}`}
+              data-testid="edit-link-tags-input"
+              placeholder="marketing, launch"
+              value={tagsText}
+              onChange={(e) => setTagsText(e.target.value)}
+            />
           </div>
         </div>
         <DialogFooter>

@@ -84,6 +84,34 @@ def normalize_url(raw: str) -> str:
     return raw
 
 
+TAG_RE = re.compile(r'^[A-Za-z0-9 _-]{1,24}$')
+
+
+def normalize_tags(tags: Optional[List[str]]) -> List[str]:
+    """Trim, dedupe (case-insensitive), validate and cap tags at 5."""
+    if not tags:
+        return []
+    result = []
+    seen = set()
+    for raw in tags:
+        tag = str(raw).strip()
+        if not tag:
+            continue
+        if not TAG_RE.match(tag):
+            raise HTTPException(
+                status_code=422,
+                detail=f'Invalid tag "{tag[:24]}" - use up to 24 letters, numbers, spaces, dashes',
+            )
+        key = tag.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(tag)
+        if len(result) >= 5:
+            break
+    return result
+
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -265,6 +293,7 @@ class LinkCreate(BaseModel):
     url: str
     custom_alias: Optional[str] = None
     expires_at: Optional[str] = None
+    tags: Optional[List[str]] = None
 
 
 class BulkShortenInput(BaseModel):
@@ -287,6 +316,7 @@ class LinkUpdate(BaseModel):
     url: Optional[str] = None
     expires_at: Optional[str] = None
     clear_expiry: bool = False
+    tags: Optional[List[str]] = None
 
 
 class DailyPoint(BaseModel):
@@ -311,6 +341,7 @@ class Link(BaseModel):
     expires_at: Optional[str] = None
     is_expired: bool = False
     owner_id: Optional[str] = None
+    tags: List[str] = []
 
 
 class PaginatedLinks(BaseModel):
@@ -370,6 +401,7 @@ def doc_to_link(doc: dict) -> Link:
         expires_at=doc.get('expires_at'),
         is_expired=is_expired(doc.get('expires_at')),
         owner_id=doc.get('owner_id'),
+        tags=doc.get('tags') or [],
     )
 
 
@@ -567,6 +599,7 @@ async def shorten(payload: LinkCreate, request: Request):
         'created_at': now_utc().isoformat(),
         'expires_at': expires_at,
         'owner_id': user['user_id'] if user else None,
+        'tags': normalize_tags(payload.tags),
     }
     await db.links.insert_one(dict(doc))
     await cache_set(code, {'url': url, 'expires_at': expires_at})
@@ -644,6 +677,8 @@ async def update_link(code: str, payload: LinkUpdate, request: Request):
             raise
         except Exception:
             raise HTTPException(status_code=422, detail='Invalid expiration date')
+    if payload.tags is not None:
+        updates['tags'] = normalize_tags(payload.tags)
     if not updates:
         raise HTTPException(status_code=422, detail='Nothing to update')
 
@@ -652,6 +687,58 @@ async def update_link(code: str, payload: LinkUpdate, request: Request):
     await cache_set(code, {'url': doc['url'], 'expires_at': doc.get('expires_at')})
     logger.info('Updated link %s (fields=%s)', code, list(updates.keys()))
     return doc_to_link(doc)
+
+
+@api_router.get('/tags', response_model=List[str])
+async def list_tags(request: Request):
+    """Distinct tags within the caller's link scope, sorted alphabetically."""
+    user = await get_current_user(request)
+    tags = await db.links.distinct('tags', scope_query(user))
+    return sorted([t for t in tags if t], key=str.lower)
+
+
+@api_router.get('/links/export.csv')
+async def export_links_csv(request: Request, q: str = '', tag: str = ''):
+    """Export the caller's visible links (same scoping/filters as GET /api/links) as CSV."""
+    import csv
+    from io import StringIO
+
+    user = await get_current_user(request)
+    query = scope_query(user)
+    filters = [query]
+    q = q.strip()
+    if q:
+        rx = {'$regex': re.escape(q), '$options': 'i'}
+        filters.append({'$or': [{'code': rx}, {'url': rx}]})
+    tag = tag.strip()
+    if tag:
+        filters.append({'tags': {'$regex': f'^{re.escape(tag)}$', '$options': 'i'}})
+    query = {'$and': filters} if len(filters) > 1 else query
+
+    proto = request.headers.get('x-forwarded-proto', 'https').split(',')[0].strip()
+    host = request.headers.get('x-forwarded-host') or request.headers.get('host', 'localhost')
+
+    docs = await db.links.find(query, {'_id': 0}).sort('created_at', -1).to_list(5000)
+    buf = StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(['code', 'short_url', 'destination_url', 'clicks', 'tags', 'created_at', 'expires_at', 'status'])
+    for d in docs:
+        writer.writerow([
+            d['code'],
+            f'{proto}://{host}/{d["code"]}',
+            d['url'],
+            int(d.get('clicks', 0)),
+            '|'.join(d.get('tags') or []),
+            d.get('created_at', ''),
+            d.get('expires_at') or '',
+            'expired' if is_expired(d.get('expires_at')) else 'active',
+        ])
+    filename = f'linkmint-links-{now_utc().strftime("%Y%m%d")}.csv'
+    return Response(
+        content=buf.getvalue(),
+        media_type='text/csv; charset=utf-8',
+        headers={'Content-Disposition': f'attachment; filename="{filename}"'},
+    )
 
 
 @api_router.get('/links/{code}/analytics', response_model=AnalyticsResponse)
@@ -673,13 +760,18 @@ async def link_analytics(code: str, request: Request, days: int = 30):
 
 
 @api_router.get('/links', response_model=PaginatedLinks)
-async def list_links(request: Request, q: str = '', page: int = 1, limit: int = 25):
+async def list_links(request: Request, q: str = '', tag: str = '', page: int = 1, limit: int = 25):
     user = await get_current_user(request)
     query = scope_query(user)
+    filters = [query]
     q = q.strip()
     if q:
         rx = {'$regex': re.escape(q), '$options': 'i'}
-        query = {'$and': [query, {'$or': [{'code': rx}, {'url': rx}]}]}
+        filters.append({'$or': [{'code': rx}, {'url': rx}]})
+    tag = tag.strip()
+    if tag:
+        filters.append({'tags': {'$regex': f'^{re.escape(tag)}$', '$options': 'i'}})
+    query = {'$and': filters} if len(filters) > 1 else query
     limit = max(1, min(limit, 100))
     page = max(1, page)
     total = await db.links.count_documents(query)

@@ -16,6 +16,8 @@ export const getHealth = () => api.get("/health");
 export const deleteLink = (code) => api.delete(`/links/${code}`);
 export const updateLink = (code, data) => api.patch(`/links/${code}`, data);
 export const getLinkAnalytics = (code, days = 30) => api.get(`/links/${code}/analytics`, { params: { days } });
+export const getTags = () => api.get("/tags");
+export const exportLinksCsv = (params) => api.get("/links/export.csv", { params, responseType: "blob" });
 export const resolveCode = (code) => api.get(`/resolve/${code}`);
 
 // Auth
